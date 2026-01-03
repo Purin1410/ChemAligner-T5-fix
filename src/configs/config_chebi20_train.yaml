@@ -1,0 +1,75 @@
+t5:
+  pretrained_model_name_or_path: "QizhiPei/biot5-plus-base"
+
+trainer_init:
+  seed_everything: 2183
+  cuda: true
+  deterministic: true
+  strategy: "ddp_find_unused_parameters_true"
+
+  output_folder: "output/lpm24_train"
+  filename: "ckpt_{epoch}_{eval_loss}"
+  save_top_k: 3
+  verbose: true
+  monitor: "eval_loss"
+  mode: "min"
+
+  max_epochs: 100
+  num_devices: 4
+  precision: "32"
+
+  gradient_clip_val: 1.0
+  gradient_clip_algorithm: "norm"
+  grad_accum: 8
+
+  lr: 5e-5
+  warmup_ratio: 0.0
+
+  # Optimizer config (used by LightningModule.configure_optimizers)
+  optimizer:
+    name: "adamw"          # "adamw" or "sgd"
+    weight_decay: 1e-4
+    momentum: 0.9          # used only for SGD
+
+  optuna:
+    activate: false
+    lr_sweep: [5e-5, 1e-4, 2e-4, 5e-4]
+    n_trials: 10
+
+  wandb:
+    project: "ACL_Lang2Mol"
+    name: "lpm24_train"
+
+dataset_init:
+  dataset_name: "chebi-20"
+  task: "lang2mol"
+  train_batch_size: 8
+  val_batch_size: 64
+  num_workers: 24
+
+method_init:
+  method: "chemaligner"
+  seq2seq_loss_weight: 1.0
+  contrastive_loss_weight: 0.3
+
+eval_init:
+  # Generation config
+  max_length: 512
+  num_beams: 1
+  use_amp: true
+  max_samples: 0          # 0 means unlimited
+  chunk_size: 1024
+  compute_fcd: false
+  run_text2mol_metrics: true
+
+  # Optional: used by your external evaluation script
+  print_examples: 0
+  offline: false
+
+  output_dir: "results/lang2mol_eval"
+  summary_file: "metrics_summary.csv"
+
+  checkpoint_paths:
+    - ".../ckpt_epoch=10.ckpt"
+    - ".../ckpt_epoch=20.ckpt"
+    - ".../ckpt_epoch=30.ckpt"
