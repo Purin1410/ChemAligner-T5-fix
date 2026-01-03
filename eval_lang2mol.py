@@ -29,48 +29,32 @@ from src.dataset_module import get_dataloaders
 from src.metric_evaluator.translation_metrics import Mol2Text_translation
 
 # Optional extra metrics
-try:
-    from src.metric_evaluator.text2mol_metrics import Text2MolMetrics
-except Exception:
-    Text2MolMetrics = None  # type: ignore
+from src.metric_evaluator.text2mol import Text2MolMetrics
+
 
 # Optional FCD
-try:
-    from src.metric_evaluator.fcd import get_fcd  # type: ignore
+from fcd import get_fcd
 
-    def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
-        return float(get_fcd(smiles_gt, smiles_pred))
+def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
+    return float(get_fcd(smiles_gt, smiles_pred))
 
-except Exception:
-    get_fcd = None  # type: ignore
-    fcd_fn = None  # type: ignore
 
 
 # -----------------------------
 # Model mapping (same idea as train.py)
 # -----------------------------
 METHOD_MAP: Dict[str, Any] = {}
-try:
-    from src.lighning_module_base import T5Model as T5ModelBase  # type: ignore
+from src.lighning_module_base import T5Model  # type: ignore
+METHOD_MAP["base"] = T5Model
+METHOD_MAP["chemaligner"] = T5Model
 
-    METHOD_MAP["base"] = T5ModelBase
-except Exception:
-    pass
+# # Fallback to your older module path
+# try:
+#     from src.lightning_module_lang2mol_base import T5Model as T5ModelLang2MolBase  # type: ignore
 
-try:
-    from src.lightning_module import T5Model as T5ModelContrastive  # type: ignore
-
-    METHOD_MAP["chemaligner"] = T5ModelContrastive
-except Exception:
-    pass
-
-# Fallback to your older module path
-try:
-    from src.lightning_module_lang2mol_base import T5Model as T5ModelLang2MolBase  # type: ignore
-
-    METHOD_MAP.setdefault("lang2mol_base", T5ModelLang2MolBase)
-except Exception:
-    T5ModelLang2MolBase = None  # type: ignore
+#     METHOD_MAP.setdefault("lang2mol_base", T5ModelLang2MolBase)
+# except Exception:
+#     T5ModelLang2MolBase = None  # type: ignore
 
 
 DATASET_MAP = {
@@ -269,10 +253,11 @@ def fill_args_from_config(args: Namespace, config: Config) -> None:
 
     # Eval init block (optional). If missing, use sensible defaults.
     args.split = str(cfg_get(config, "eval_init.split", "validation"))
-    args.eval_batch_size = int(cfg_get(config, "eval_init.batch_size", cfg_get(config, "dataset_init.val_batch_size", 1)))
+    args.eval_batch_size = int(cfg_get(config, "eval_init.eval_batch_size", 1))
     args.print_examples = int(cfg_get(config, "eval_init.print_examples", 0))
     args.offline = bool(cfg_get(config, "eval_init.offline", False))
     args.run_text2mol_metrics = bool(cfg_get(config, "eval_init.run_text2mol_metrics", False))
+    args.eval_compute_fcd = True
 
     # Precision: can override in eval_init.precision, else fallback to trainer_init.precision
     prec_cfg = cfg_get(config, "eval_init.precision", cfg_get(config, "trainer_init.precision", "32"))
@@ -302,19 +287,23 @@ def evaluate_from_csv(csv_path: str, run_text2mol_metrics: bool) -> Dict[str, An
     results: Dict[str, Any] = {}
 
     # Chemical metrics (your required evaluator)
-    evaluator = Mol2Text_translation()
-    res = evaluator(pred_selfies, gt_selfies)
-    for k, v in res.items():
-        results[k] = v
+    # evaluator = Mol2Text_translation()
+    # res = evaluator(pred_selfies, gt_selfies)
+    # for k, v in res.items():
+    #     results[k] = v
 
     # Optional extra metrics
     if run_text2mol_metrics and Text2MolMetrics is not None:
         try:
             if fcd_fn is not None:
-                t2m = Text2MolMetrics(eval_text2mol=False, fcd_fn=fcd_fn)
+                t2m = Text2MolMetrics(eval_text2mol=True, fcd_fn=fcd_fn)
             else:
-                t2m = Text2MolMetrics(eval_text2mol=False, fcd_fn=None)  # type: ignore
-            res2 = t2m(pred_selfies, gt_selfies)
+                t2m = Text2MolMetrics(eval_text2mol=True, fcd_fn=None)  # type: ignore
+            res2 = t2m(predictions=pred_selfies,
+                        references=gt_selfies,
+                        selfies_gt=gt_selfies,
+                        selfies_pred=pred_selfies,)
+            print(res2)
             for k, v in res2.items():
                 results[f"text2mol_{k}"] = v
         except Exception as e:
@@ -396,30 +385,31 @@ def run_one_checkpoint(
                         continue
 
                 batch = move_to_device(batch, device)
-
-                if autocast_enabled:
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=True):
-                        pred_selfies = model.generate_captioning(batch)
-                else:
+                with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=autocast_enabled):
                     pred_selfies = model.generate_captioning(batch)
+                # print(pred_selfies)
+
 
                 gt_selfies = batch["selfies"]
                 captions = batch.get("caption", [""] * len(gt_selfies))
 
                 # Optional prints (slow)
-                if args.print_examples > 0 and step_idx < args.print_examples and (not is_dist or is_main(rank)):
+                if args.print_examples > 0 and (step_idx < args.print_examples) and (is_main(rank) or (not is_dist)):
                     for p, g in zip(pred_selfies[:3], gt_selfies[:3]):
-                        print(f"[{ckpt_name}] Predict: {p}")
-                        print(f"[{ckpt_name}] GT: {g}")
+                        print(f"Predict: {p}")
+                        print(f"GT: {g}")
                         print("-" * 50)
 
                 writer.writerows(
-                    [{"caption": c, "gt_selfie": g, "pred_selfie": p} for c, g, p in zip(captions, gt_selfies, pred_selfies)]
+                    [
+                        {"caption": c, "gt_selfie": g, "pred_selfie": p} 
+                        for c, g, p in zip(captions, gt_selfies, pred_selfies)
+                    ]
                 )
 
     # Merge + metrics only on rank 0
     if args.cuda and is_dist:
-        dist.barrier()
+        # dist.barrier()
 
         if is_main(rank):
             part_files = [f"{os.path.splitext(merged_csv)[0]}.rank{r}.csv" for r in range(world_size)]
@@ -434,7 +424,7 @@ def run_one_checkpoint(
 
             return metrics_row
 
-        dist.barrier()
+        # dist.barrier()
         return None
 
     # Single process
@@ -524,9 +514,10 @@ def main(args: Namespace, config: Config) -> None:
 
     T5ModelCls = METHOD_MAP[args.method]
     model = T5ModelCls(args)
-    model.tokenizer = tokenizer
+    model.resize_token_embeddings(len(tokenizer))
     model.to(device)
-    model.eval()
+    # model.eval()
+    model.tokenizer = tokenizer
 
     # Prepare summary file path and clear it (rank 0 only)
     summary_csv = os.path.join(args.eval_output_dir, args.summary_file)
@@ -537,8 +528,8 @@ def main(args: Namespace, config: Config) -> None:
 
     # Evaluate each checkpoint
     for ckpt_path in args.checkpoint_paths:
-        if args.cuda and is_dist:
-            dist.barrier()
+        # if args.cuda and is_dist:
+        #     dist.barrier()
 
         if (not os.path.exists(ckpt_path)) and ((not is_dist) or is_main(rank)):
             print(f"[WARN] Checkpoint does not exist: {ckpt_path}")
@@ -562,15 +553,16 @@ def main(args: Namespace, config: Config) -> None:
                 print("=== Evaluation Results ===")
                 for k, v in metrics_row.items():
                     print(f"{k}: {v}")
-                print()
+                print("\n")
 
-        if args.cuda and is_dist:
-            dist.barrier()
+        # if args.cuda and is_dist:
+        #     dist.barrier()
 
     # Cleanup
-    if args.cuda and is_dist:
-        dist.barrier()
+    if args.cuda:
+        # dist.barrier()
         dist.destroy_process_group()
+    print("End")
 
 
 if __name__ == "__main__":

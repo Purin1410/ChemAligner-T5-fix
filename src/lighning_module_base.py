@@ -5,17 +5,15 @@ import lightning as pl
 import torch
 from torch import optim
 
-from src.backbones.lang.mammut_t5 import T5ForConditionalGeneration
-from src.metric_evaluator.text2mol_metrics import Text2MolMetrics
+from src.backbones.lang.chemaligner_t5 import T5ForConditionalGeneration
+from src.metric_evaluator.text2mol import Text2MolMetrics
 
 # Optional FCD dependency
-try:
-    from fcd import get_fcd
+from fcd import get_fcd
 
-    def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
-        return float(get_fcd(smiles_gt, smiles_pred))
-except Exception:
-    fcd_fn = None
+def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
+    return float(get_fcd(smiles_gt, smiles_pred))
+
 
 class T5Model(pl.LightningModule):
     """
@@ -38,7 +36,7 @@ class T5Model(pl.LightningModule):
         # Metrics evaluator
         effective_fcd = fcd_fn if (bool(args.eval_compute_fcd) and fcd_fn is not None) else None
         self.metric_evaluator = Text2MolMetrics(
-            eval_text2mol=bool(args.eval_run_text2mol_metrics),
+            eval_text2mol=bool(args.run_text2mol_metrics),
             fcd_fn=effective_fcd,
         )
 
@@ -138,7 +136,7 @@ class T5Model(pl.LightningModule):
                     num_beams=int(self.args.eval_num_beams),
                 )
 
-        pred_selfies = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        pred_selfies = self.tokenizer.batch_decode(pred_ids)
         pred_selfies = [
             s.replace("<unk>", "")
              .replace("<pad>", "")
@@ -264,7 +262,7 @@ class T5Model(pl.LightningModule):
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
-    def generate_molecule(
+    def generate_captioning(
         self,
         inputs,
         max_length: int = 512,
@@ -294,7 +292,7 @@ class T5Model(pl.LightningModule):
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
         )
-        decoded = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
+        decoded = self.tokenizer.batch_decode(out_ids)
         decoded = [
             s.replace("<unk>", "")
              .replace("<pad>", "")

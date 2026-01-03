@@ -1,10 +1,9 @@
 import os
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset
 from torch_geometric.data import DataLoader as DataLoaderGeo
 from datasets import load_dataset
-from torchvision import datasets, transforms
+from torchvision import transforms
 from transformers import AutoTokenizer
-from .backbones.graph.graph_featurizer import GraphFeaturizer
 
 class MoleculeGeneration(Dataset):
     def __init__(self,

@@ -97,7 +97,7 @@ def train_once(args, config, trial=None):
     val_dataloader = get_dataloaders(
         args,
         tokenizer,
-        batch_size=int(config.dataset_init.val_batch_size),
+        batch_size=int(config.dataset_init.eval_batch_size),
         num_workers=int(config.dataset_init.num_workers),
         split="validation",
         task=str(config.dataset_init.task),

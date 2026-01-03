@@ -5,17 +5,15 @@ import lightning as pl
 import torch
 from torch import optim
 
-from src.backbones.lang.mammut_t5 import T5ForConditionalGeneration
-from src.metric_evaluator.text2mol_metrics import Text2MolMetrics
+from src.backbones.lang.chemaligner_t5 import T5ForConditionalGeneration
+from src.metric_evaluator.text2mol import Text2MolMetrics
 
 # Optional FCD dependency
-try:
-    from fcd import get_fcd
+from fcd import get_fcd
 
-    def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
-        return float(get_fcd(smiles_gt, smiles_pred))
-except Exception:
-    fcd_fn = None
+def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
+    return float(get_fcd(smiles_gt, smiles_pred))
+
 
 class T5Model(pl.LightningModule):
     """
@@ -155,7 +153,7 @@ class T5Model(pl.LightningModule):
         self._buf_input_ids, self._buf_attention_mask, self._buf_gt_selfies = [], [], []
         self._buf_size = 0
 
-    @torch.no_grad()
+    # @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         input_ids, attention_mask, labels = self._prepare_inputs(batch)
 
@@ -267,7 +265,7 @@ class T5Model(pl.LightningModule):
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
-    def generate_molecule(
+    def generate_captioning(
         self,
         inputs,
         max_length: int = 512,
@@ -297,7 +295,7 @@ class T5Model(pl.LightningModule):
             eos_token_id=eos_token_id,
             pad_token_id=pad_token_id,
         )
-        decoded = self.tokenizer.batch_decode(out_ids, skip_special_tokens=True)
+        decoded = self.tokenizer.batch_decode(out_ids)
         decoded = [
             s.replace("<unk>", "")
              .replace("<pad>", "")
