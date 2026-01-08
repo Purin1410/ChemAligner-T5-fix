@@ -1,6 +1,5 @@
 from argparse import ArgumentParser, Namespace
 import math
-
 import lightning as pl
 import optuna
 from sconf import Config
@@ -12,6 +11,11 @@ from lightning.pytorch import seed_everything
 from src.dataset_module import get_dataloaders
 from src.lighning_module_base import T5Model as T5ModelBase
 from src.lightning_module import T5Model as T5ModelContrastive
+from src.utils import (collect_ckpt_paths, 
+                       build_resolved_eval_yaml, 
+                       run_eval_subprocess, 
+                       enable_tf32_if_tensor_cores_available,
+                       infer_eval_config_path_from_train)
 
 
 METHOD_MAP = {
@@ -27,12 +31,11 @@ DATASET_MAP = {
 }
 
 
-def inject_config_to_args(args: Namespace, config: Config, tokenizer, train_dataloader) -> Namespace:
+def inject_config_to_args(args: Namespace, config: Config, tokenizer) -> Namespace:
     """
     Inject config values into args.* so downstream code can keep using args.xxx
     without breaking your current code structure.
     """
-
     # Model backbone
     args.t5 = Namespace()
     args.t5.pretrained_model_name_or_path = config.t5.pretrained_model_name_or_path
@@ -42,10 +45,6 @@ def inject_config_to_args(args: Namespace, config: Config, tokenizer, train_data
     args.warmup_ratio = float(config.trainer_init.warmup_ratio)
     args.max_epochs = int(config.trainer_init.max_epochs)
     args.grad_accum = int(config.trainer_init.grad_accum)
-
-    # Steps per epoch for scheduler
-    steps_per_epoch = int(math.ceil(len(train_dataloader) / max(1, args.grad_accum)))
-    args.train_data_len = steps_per_epoch
 
     # Token ids used in LightningModule forward
     args.pad_token_id = int(tokenizer.pad_token_id)
@@ -60,10 +59,12 @@ def inject_config_to_args(args: Namespace, config: Config, tokenizer, train_data
     args.eval_num_beams = int(config.eval_init.num_beams)
     args.eval_use_amp = bool(config.eval_init.use_amp)
     args.eval_max_samples = int(config.eval_init.max_samples)
-    args.eval_num_proc = int(config.dataset_init.num_workers)
+    args.eval_num_proc = int(config.dataset_init.num_workers/config.trainer_init.num_devices)
     args.eval_chunk_size = int(config.eval_init.chunk_size)
     args.eval_compute_fcd = bool(config.eval_init.compute_fcd)
-    args.eval_run_text2mol_metrics = bool(config.eval_init.run_text2mol_metrics)
+    args.run_text2mol_metrics = bool(config.eval_init.run_text2mol_metrics)
+    args.pin_memory = bool(config.dataset_init.pin_memory)
+    args.persistent_workers = bool(config.dataset_init.persistent_workers)
 
     # Optimizer settings (optional but recommended)
     args.optimizer_name = str(config.trainer_init.optimizer.name)
@@ -82,29 +83,31 @@ def train_once(args, config, trial=None):
     # ============================== Dataloaders ==============================
     if config.dataset_init.dataset_name not in DATASET_MAP:
         raise ValueError(f"Invalid dataset_name. Choose in: {', '.join(DATASET_MAP.keys())}")
-
+    
+    # ============================== Inject config to args ==============================
+    args = inject_config_to_args(args, config, tokenizer)
     args.dataset_name_or_path = DATASET_MAP[config.dataset_init.dataset_name]
 
     train_dataloader = get_dataloaders(
         args,
         tokenizer,
         batch_size=int(config.dataset_init.train_batch_size),
-        num_workers=int(config.dataset_init.num_workers),
+        num_workers=int(config.dataset_init.num_workers/config.trainer_init.num_devices),
         split="train",
         task=str(config.dataset_init.task),
     )
+    steps_per_epoch = int(math.ceil(len(train_dataloader) / (max(1, args.grad_accum) * config.trainer_init.num_devices)))
+    args.train_data_len = steps_per_epoch
 
     val_dataloader = get_dataloaders(
         args,
         tokenizer,
         batch_size=int(config.dataset_init.eval_batch_size),
-        num_workers=int(config.dataset_init.num_workers),
+        num_workers=int(config.dataset_init.num_workers/config.trainer_init.num_devices),
         split="validation",
         task=str(config.dataset_init.task),
     )
 
-    # ============================== Inject config to args ==============================
-    args = inject_config_to_args(args, config, tokenizer, train_dataloader)
 
     # ============================== Build model ==============================
     T5Model = METHOD_MAP[str(config.method_init.method)]
@@ -163,8 +166,13 @@ def train_with_optuna(config, args):
             "lr", list(config.trainer_init.optuna.lr_sweep)
         )
 
-        print(f"[Trial {trial.number}] lr = {trial_args.lr}")
+        print(
+            f"[Trial {trial.number}] "
+            f"lr={trial_args.lr}, "
+        )
+
         return train_once(trial_args, config, trial=trial)
+
 
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=int(config.trainer_init.optuna.n_trials))
@@ -177,17 +185,51 @@ def train_with_optuna(config, args):
         print(f"    {k}: {v}")
 
 
+
 def main(args, config):
+    # ============================== Training Phase ==============================
     if bool(config.trainer_init.optuna.activate):
         train_with_optuna(config, args)
     else:
         train_once(args, config)
 
+    # ============================== Post-Training Evaluation ==============================
+    if (not bool(config.trainer_init.optuna.activate)) and bool(config.eval_init.run_evaluate_after_trainning_done):
+
+        # Choose eval YAML file (user override has priority)
+        eval_yaml_path = (
+            config.eval_init.config_file
+            if getattr(config.eval_init, "config_file", None) is not None
+            else infer_eval_config_path_from_train(args.model_config)
+        )
+
+        # Collect all checkpoints produced by training
+        ckpt_paths = collect_ckpt_paths(config.trainer_init.output_folder)
+        if len(ckpt_paths) == 0:
+            raise FileNotFoundError(f"No .ckpt files found in: {config.trainer_init.output_folder}")
+
+        # Build a resolved eval YAML that contains the checkpoint list
+        resolved_eval_yaml = build_resolved_eval_yaml(
+            eval_yaml_path=eval_yaml_path,
+            ckpt_paths=ckpt_paths,
+            out_dir=config.trainer_init.output_folder,
+        )
+
+        # Run evaluation using python or torchrun depending on number of devices
+        run_eval_subprocess(
+            resolved_eval_yaml=resolved_eval_yaml,
+            num_devices=int(getattr(config.trainer_init, "num_devices", 1) or 1),
+        )
+
 
 if __name__ == "__main__":
+    enabled = enable_tf32_if_tensor_cores_available()
+    print("TF32 enabled:", enabled)
+
     parser = ArgumentParser()
     parser.add_argument("--model_config", type=str, default="src/configs/config_lpm24_train.yaml")
     args = parser.parse_args()
 
     config = Config(args.model_config)
     main(args, config)
+

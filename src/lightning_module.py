@@ -37,7 +37,8 @@ class T5Model(pl.LightningModule):
         # If you want FCD, require fcd_fn availability. Otherwise set None.
         effective_fcd = fcd_fn if (args.eval_compute_fcd and fcd_fn is not None) else None
         self.metric_evaluator = Text2MolMetrics(
-            eval_text2mol=bool(args.eval_run_text2mol_metrics),
+            device = "cuda",
+            # eval_text2mol=bool(args.run_text2mol_metrics),
             fcd_fn=effective_fcd,
         )
 
@@ -49,6 +50,8 @@ class T5Model(pl.LightningModule):
         self._buf_attention_mask: List[torch.Tensor] = []
         self._buf_gt_selfies: List[List[str]] = []
         self._buf_size: int = 0
+        
+        self.avg_metrics = 0
 
     def resize_token_embeddings(self, vocab_size: int) -> None:
         self.t5_model.resize_token_embeddings(vocab_size)
@@ -59,7 +62,7 @@ class T5Model(pl.LightningModule):
     def forward(self, input_ids, attention_mask, labels=None):
         # Replace padding token id with -100 so it is ignored by LM loss
         labels = labels.clone()
-        labels[labels == self.args.pad_token_id] = -100
+        labels[labels == int(self.args.pad_token_id)] = -100
 
         out = self.t5_model.forward_train(
             input_ids=input_ids,
@@ -78,9 +81,12 @@ class T5Model(pl.LightningModule):
         self.log("train/total_loss", loss, prog_bar=True, logger=True)
         self.log("train/lm_loss", lm_loss, prog_bar=False, logger=True)
         self.log("train/contrastive_loss", contrastive_loss, prog_bar=False, logger=True)
+        
         return loss
 
     def on_validation_epoch_start(self):
+        if not bool(self.args.run_text2mol_metrics):
+            return
         self._val_pred_selfies = []
         self._val_gt_selfies = []
         self._buf_input_ids, self._buf_attention_mask, self._buf_gt_selfies = [], [], []
@@ -141,7 +147,7 @@ class T5Model(pl.LightningModule):
                     num_beams=int(self.args.eval_num_beams),
                 )
 
-        pred_selfies = self.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+        pred_selfies = self.tokenizer.batch_decode(pred_ids)
         pred_selfies = [s.replace("<unk>", "").replace("<pad>", "").replace("</s>", "").strip() for s in pred_selfies]
         gt_selfies = [(s or "").strip() for s in mega_gt]
 
@@ -161,9 +167,13 @@ class T5Model(pl.LightningModule):
         self.log("val/total_loss", loss, prog_bar=True, logger=True)
         self.log("val/lm_loss", lm_loss, prog_bar=False, logger=True)
         self.log("val/contrastive_loss", contrastive_loss, prog_bar=False, logger=True)
+        self.log("avg_metrics", self.avg_metrics, prog_bar=False, on_epoch=True, logger=True)
 
         # Keep monitor name stable for checkpointing
-        self.log("eval_loss", contrastive_loss, prog_bar=False, logger=False)
+        self.log("eval_loss", loss, prog_bar=False, logger=False)
+
+        if not bool(self.args.run_text2mol_metrics):
+            return
 
         # Only compute molecule metrics for lang2mol batches
         if "selfies" not in batch:
@@ -190,6 +200,9 @@ class T5Model(pl.LightningModule):
         return [obj]
 
     def on_validation_epoch_end(self):
+        torch.cuda.empty_cache()
+        if not bool(self.args.run_text2mol_metrics):
+            return
         # Flush remaining examples
         self._flush_buf_generate()
 
@@ -218,12 +231,18 @@ class T5Model(pl.LightningModule):
             compute_fcd=bool(self.args.eval_compute_fcd),
         )
 
+        avg_metrics = 0
+        count = 0
         for k, v in mol_metrics.items():
             if v is None:
                 continue
-            self.log(f"val_metric/{k}", v, prog_bar=False, logger=True, sync_dist=False)
-
-        self.log("val_metric/n_samples", float(len(all_preds)), prog_bar=False, logger=True, sync_dist=False)
+            self.log(f"val_metric/{k}", v, prog_bar=False, on_epoch=True,logger=True)
+            if k != "validity":
+                avg_metrics += v
+                count +=1
+        self.avg_metrics = avg_metrics/count if count > 0 else 0
+        self.log("avg_metrics", self.avg_metrics, prog_bar=False, on_epoch=True, logger=True)
+        self.log("val_metric/n_samples", float(len(all_preds)), on_epoch=True, prog_bar=False, logger=True)
 
     def configure_optimizers(self):
         # Total optimization steps
@@ -264,6 +283,13 @@ class T5Model(pl.LightningModule):
             return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
         return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    def on_train_epoch_end(self):
+        torch.cuda.empty_cache()
+    def on_train_step_end(self):
+        torch.cuda.empty_cache()
+    def on_validation_step_end(self):
+        torch.cuda.empty_cache()
     
     def generate_captioning(
         self,

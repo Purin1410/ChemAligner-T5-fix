@@ -5,7 +5,7 @@ import lightning as pl
 import torch
 from torch import optim
 
-from src.backbones.lang.chemaligner_t5 import T5ForConditionalGeneration
+from transformers.models.t5 import T5ForConditionalGeneration
 from src.metric_evaluator.text2mol import Text2MolMetrics
 
 # Optional FCD dependency
@@ -16,13 +16,6 @@ def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
 
 
 class T5Model(pl.LightningModule):
-    """
-    Baseline seq2seq LightningModule:
-    - No contrastive loss
-    - No config parsing here
-    - All hyperparams must be injected into args in train.py
-    """
-
     def __init__(self, args):
         super().__init__()
         self.args = args
@@ -36,7 +29,6 @@ class T5Model(pl.LightningModule):
         # Metrics evaluator
         effective_fcd = fcd_fn if (bool(args.eval_compute_fcd) and fcd_fn is not None) else None
         self.metric_evaluator = Text2MolMetrics(
-            eval_text2mol=bool(args.run_text2mol_metrics),
             fcd_fn=effective_fcd,
         )
 
@@ -49,6 +41,8 @@ class T5Model(pl.LightningModule):
         self._buf_attention_mask: List[torch.Tensor] = []
         self._buf_gt_selfies: List[List[str]] = []
         self._buf_size: int = 0
+        
+        self.avg_metrics = 0
 
     def resize_token_embeddings(self, vocab_size: int) -> None:
         self.t5_model.resize_token_embeddings(vocab_size)
@@ -163,6 +157,7 @@ class T5Model(pl.LightningModule):
 
         self.log("val/lm_loss", loss, prog_bar=True, logger=True)
         self.log("eval_loss", loss, prog_bar=False, logger=False)
+        self.log("avg_metrics", self.avg_metrics, prog_bar=False, on_epoch=True, logger=True)
 
         # Only compute molecule metrics for lang2mol batches
         if "selfies" not in batch:
@@ -178,6 +173,7 @@ class T5Model(pl.LightningModule):
         target_bs = int(self.args.eval_batch_size)
         if self._buf_size >= target_bs:
             self._flush_buf_generate()
+        
 
     def _ddp_all_gather_object(self, obj: Any) -> List[Any]:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -216,12 +212,18 @@ class T5Model(pl.LightningModule):
             compute_fcd=bool(self.args.eval_compute_fcd),
         )
 
+        avg_metrics = 0
+        count = 0
         for k, v in mol_metrics.items():
             if v is None:
                 continue
-            self.log(f"val_metric/{k}", v, prog_bar=False, logger=True, sync_dist=False)
-
-        self.log("val_metric/n_samples", float(len(all_preds)), prog_bar=False, logger=True, sync_dist=False)
+            self.log(f"val_metric/{k}", v, prog_bar=False, on_epoch=True,logger=True)
+            if k != "validity":
+                avg_metrics += v
+                count +=1
+        self.avg_metrics = avg_metrics/count if count > 0 else 0
+        self.log("avg_metrics", self.avg_metrics, prog_bar=False, on_epoch=True, logger=True)
+        self.log("val_metric/n_samples", float(len(all_preds)), on_epoch=True, prog_bar=False, logger=True)
 
     def configure_optimizers(self):
         # Total optimization steps

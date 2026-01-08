@@ -3,6 +3,189 @@ from typing import List
 from argparse import Namespace
 import torch
 
+import sys
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+
+def infer_eval_config_path_from_train(train_config_path: str) -> str:
+    """
+    Infer evaluation config path from training config path by
+    replacing the suffix '_train' with '_eval' in the filename.
+
+    Example:
+      src/configs/config_lpm24_train.yaml
+      -> src/configs/config_lpm24_eval.yaml
+    """
+    train_path = Path(train_config_path)
+
+    name = train_path.name
+    if "_train" in name:
+        eval_name = name.replace("_train", "_eval")
+    else:
+        # Fallback: keep the original name if no '_train' suffix is found
+        # This avoids breaking when users provide non-standard config names
+        eval_name = name
+
+    return str(train_path.with_name(eval_name))
+
+def normalize_checkpoint_list(x: Any) -> List[str]:
+    """
+    Accept:
+      - string path
+      - list of string paths
+      - None
+    Return list[str].
+    """
+    if x is None:
+        return []
+    if isinstance(x, str):
+        x = x.strip()
+        return [x] if x else []
+    if isinstance(x, (list, tuple)):
+        out = []
+        for it in x:
+            if it is None:
+                continue
+            s = str(it).strip()
+            if s:
+                out.append(s)
+        return out
+    s = str(x).strip()
+    return [s] if s else []
+
+
+def collect_ckpt_paths(output_folder: str) -> List[str]:
+    """
+    Collect all .ckpt files in output_folder and return a sorted list of paths.
+    """
+    ckpt_dir = Path(str(output_folder))
+    ckpt_paths = sorted([str(p) for p in ckpt_dir.glob("*.ckpt")])
+    return ckpt_paths
+
+
+def build_resolved_eval_yaml(eval_yaml_path: str, ckpt_paths: List[str], out_dir: str) -> str:
+    """
+    Load eval YAML, replace eval_init.checkpoint_paths, then dump to a new YAML file.
+    Return path to the resolved YAML.
+    """
+    eval_yaml_path = str(eval_yaml_path)
+    out_dir = str(out_dir)
+
+    with open(eval_yaml_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    cfg.setdefault("eval_init", {})
+    cfg["eval_init"]["checkpoint_paths"] = normalize_checkpoint_list(ckpt_paths)
+
+    # Save resolved YAML inside the training output folder for traceability
+    out_path = Path(out_dir) / f"resolved_{Path(eval_yaml_path).name}"
+    with open(out_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+
+    return str(out_path)
+
+
+def run_eval_subprocess(resolved_eval_yaml: str, num_devices: int) -> None:
+    """
+    Run eval_lang2mol via subprocess.
+    - Single GPU: python eval_lang2mol.py --model_config <yaml>
+    - Multi GPU: torchrun --nproc_per_node=<num_devices> eval_lang2mol.py --model_config <yaml>
+    """
+    num_devices = int(num_devices or 1)
+
+    if num_devices <= 1:
+        cmd = [sys.executable, "eval_lang2mol.py", "--model_config", resolved_eval_yaml]
+    else:
+        cmd = ["torchrun", f"--nproc_per_node={num_devices}", "eval_lang2mol.py", "--model_config", resolved_eval_yaml]
+
+    print("[Eval] Running command:", " ".join(cmd))
+    subprocess.run(cmd, check=True)
+
+
+
+
+
+def enable_tf32_if_tensor_cores_available(device: int | None = None, verbose: bool = True) -> bool:
+    """
+    Check GPU availability and (if Tensor Cores are present) enable TF32 /
+    set_float32_matmul_precision("high").
+
+    Returns:
+        True if TF32 is enabled, False otherwise
+        (no CUDA / no Tensor Cores / fallback case).
+
+    Notes:
+    - Call this function once at the beginning of the program before training/evaluation.
+    - TF32 / Tensor Cores trade numerical precision for performance.
+      Bit-for-bit reproducibility is not guaranteed when TF32 is enabled.
+    """
+    if not torch.cuda.is_available():
+        if verbose:
+            print("CUDA is not available — TF32 not enabled.")
+        return False
+
+    # Select device (default: current CUDA device)
+    if device is None:
+        device = torch.cuda.current_device()
+    try:
+        prop = torch.cuda.get_device_properties(device)
+    except Exception as e:
+        if verbose:
+            print(f"Failed to retrieve device properties: {e}")
+        return False
+
+    name = prop.name
+    major = prop.major
+    minor = prop.minor
+    compute_capability = major + minor / 10.0
+
+    # Heuristic: Tensor Cores are available on GPUs with compute capability >= 7.0
+    # (Volta, Turing?, Ampere, Ada, Hopper, ...)
+    has_tensor_cores = major >= 7
+
+    if verbose:
+        print(f"Device {device}: {name}, compute capability {major}.{minor} ({compute_capability})")
+        print(f"Tensor Cores detected (heuristic): {has_tensor_cores}")
+
+    if not has_tensor_cores:
+        if verbose:
+            print("No Tensor Cores detected by heuristic — keeping default settings.")
+        return False
+
+    # Enable TF32 / set precision (if supported)
+    # If PyTorch supports torch.set_float32_matmul_precision (>= ~2.0), prefer using it.
+    if hasattr(torch, "set_float32_matmul_precision"):
+        try:
+            torch.set_float32_matmul_precision("high")
+            if verbose:
+                print('Called torch.set_float32_matmul_precision("high").')
+        except Exception as e:
+            if verbose:
+                print("Failed to call set_float32_matmul_precision:", e)
+
+    # Backend flags (for older / compatible PyTorch versions)
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        # Some PyTorch versions do not expose torch.backends.cuda.matmul
+        print("Cannot activate torch.backends.cuda.matmul.allow_tf32")
+    try:
+        torch.backends.cudnn.allow_tf32 = True
+    except Exception:
+        print("Cannot activate torch.backends.cudnn.allow_tf32")
+
+    if verbose:
+        print("TF32 / allow_tf32 has been enabled (if supported by backend).")
+        print("WARNING: TF32 trades numerical precision for performance; bit-for-bit reproducibility is lost.")
+
+    return True
+
+
 def set_nested_attr(obj, key, value):
     if isinstance(value, dict):
         if not hasattr(obj, key):

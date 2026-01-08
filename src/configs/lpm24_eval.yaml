@@ -1,0 +1,37 @@
+t5:
+  pretrained_model_name_or_path: "QizhiPei/biot5-plus-base"
+
+dataset_init:
+  dataset_name: "lpm-24-extra"
+  task: "lang2mol"
+  num_workers: 24
+  split: validation
+  eval_batch_size: 240
+  pin_memory: true
+  persistent_workers: true
+
+eval_init:
+  seed_everything: 2183
+  num_devices: 1 # if >1, use torchrun to eval
+  # Setup evaluate
+  cuda: True
+  deterministic: True
+  # Generation config
+  max_length: 512
+  num_beams: 1
+  use_amp: true
+  max_samples: 0          # 0 means unlimited
+  chunk_size: 1024
+  precision: 32
+  # Optional: used by your external evaluation script
+  print_examples: 0
+  offline: false
+
+  output_dir: "results/lpm24_evaluation"
+  summary_file: "metrics_summary.csv"
+
+  checkpoint_paths:
+    - ".../ckpt_epoch=10.ckpt"
+    - ".../ckpt_epoch=20.ckpt"
+    - ".../ckpt_epoch=30.ckpt"
+

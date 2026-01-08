@@ -7,14 +7,15 @@ trainer_init:
   deterministic: true
   strategy: "ddp_find_unused_parameters_true"
 
+  # Checkpoint callback
   output_folder: "output/lpm24_train"
   filename: "ckpt_{epoch}_{eval_loss}"
   save_top_k: 3
   verbose: true
-  monitor: "eval_loss"
-  mode: "min"
+  monitor: "avg_metrics" # turn to "eval_loss" if "run_text2mol_metrics" = False
+  mode: "max" # turn to "min" if "run_text2mol_metrics" = False
 
-  max_epochs: 100
+  max_epochs: 20
   num_devices: 4
   precision: "32"
 
@@ -22,15 +23,16 @@ trainer_init:
   gradient_clip_algorithm: "norm"
   grad_accum: 8
 
-  lr: 5e-5
-  warmup_ratio: 0.0
-
-  # Optimizer config (used by LightningModule.configure_optimizers)
   optimizer:
     name: "adamw"          # "adamw" or "sgd"
     weight_decay: 1e-4
     momentum: 0.9          # used only for SGD
 
+  # Scheduler init
+  lr: 5e-5
+  warmup_ratio: 0.0
+
+  # Optimizer config (used by LightningModule.configure_optimizers)
   optuna:
     activate: false
     lr_sweep: [5e-5, 1e-4, 2e-4, 5e-4]
@@ -41,14 +43,16 @@ trainer_init:
     name: "lpm24_train"
 
 dataset_init:
-  dataset_name: "lpm-24"
+  dataset_name: "lpm-24-extra"
   task: "lang2mol"
   train_batch_size: 8
   val_batch_size: 64
   num_workers: 24
+  pin_memory: True
+  persistent_workers: True
 
 method_init:
-  method: "chemaligner"
+  method: "chemaligner" # base or chemaligner
   seq2seq_loss_weight: 1.0
   contrastive_loss_weight: 0.3
 
@@ -61,15 +65,9 @@ eval_init:
   chunk_size: 1024
   compute_fcd: false
   run_text2mol_metrics: true
+  # Init for evaluate after final training
+  run_evaluate_after_trainning_done: false
+  config_file: None # if None, it will choose lpm24_eval.yaml as default
 
-  # Optional: used by your external evaluation script
-  print_examples: 0
-  offline: false
 
-  output_dir: "results/lang2mol_eval"
-  summary_file: "metrics_summary.csv"
 
-  checkpoint_paths:
-    - ".../ckpt_epoch=10.ckpt"
-    - ".../ckpt_epoch=20.ckpt"
-    - ".../ckpt_epoch=30.ckpt"

@@ -159,7 +159,7 @@ class Text2MolMetrics:
 
     def __init__(
         self,
-        device: str = "cpu",
+        device: str = "cuda",
         text_model: str = "allenai/scibert_scivocab_uncased",
         eval_text2mol: bool = False,
         fcd_fn=None,

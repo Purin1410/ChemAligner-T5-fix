@@ -6,7 +6,7 @@
 #
 # Run:
 #   python eval_lang2mol.py --model_config src/configs/config_lpm24_train.yaml
-#   torchrun --nproc_per_node=4 eval_lang2mol.py --model_config src/configs/config_lpm24_train.yaml
+#   torchrun --nproc_per_node=<your devices> eval_lang2mol.py --model_config src/configs/config_lpm24_train.yaml
 #
 # Important:
 #   - All runtime knobs should come from config (no CLI overrides except model_config).
@@ -26,35 +26,15 @@ from transformers import AutoTokenizer
 from sconf import Config
 
 from src.dataset_module import get_dataloaders
-from src.metric_evaluator.translation_metrics import Mol2Text_translation
+# from src.metric_evaluator.translation_metrics import Mol2Text_translation
 
 # Optional extra metrics
 from src.metric_evaluator.text2mol import Text2MolMetrics
-
-
-# Optional FCD
 from fcd import get_fcd
 
 def fcd_fn(smiles_gt: List[str], smiles_pred: List[str]) -> float:
     return float(get_fcd(smiles_gt, smiles_pred))
-
-
-
-# -----------------------------
-# Model mapping (same idea as train.py)
-# -----------------------------
-METHOD_MAP: Dict[str, Any] = {}
 from src.lighning_module_base import T5Model  # type: ignore
-METHOD_MAP["base"] = T5Model
-METHOD_MAP["chemaligner"] = T5Model
-
-# # Fallback to your older module path
-# try:
-#     from src.lightning_module_lang2mol_base import T5Model as T5ModelLang2MolBase  # type: ignore
-
-#     METHOD_MAP.setdefault("lang2mol_base", T5ModelLang2MolBase)
-# except Exception:
-#     T5ModelLang2MolBase = None  # type: ignore
 
 
 DATASET_MAP = {
@@ -227,43 +207,35 @@ def fill_args_from_config(args: Namespace, config: Config) -> None:
     """
     Fill args from config so you only edit YAML.
     """
-    t5_ns = ensure_ns(args, "t5")
-    t5_ns.pretrained_model_name_or_path = config.t5.pretrained_model_name_or_path
-
-    # Trainer related
-    args.cuda = bool(cfg_get(config, "trainer_init.cuda", True))
-    args.deterministic = bool(cfg_get(config, "trainer_init.deterministic", True))
-
+    # Setup evaluate & model
+    args.t5 = Namespace()
+    args.t5.pretrained_model_name_or_path = config.t5.pretrained_model_name_or_path
+    args.cuda = bool(cfg_get(config, "eval_init.cuda", True))
+    args.deterministic = bool(cfg_get(config, "eval_init.deterministic", True))
+    
     # Dataset
     args.dataset_name = str(cfg_get(config, "dataset_init.dataset_name", "lpm-24"))
     if args.dataset_name not in DATASET_MAP:
         raise ValueError(f"Invalid dataset_name: {args.dataset_name}. Valid: {', '.join(DATASET_MAP.keys())}")
     args.dataset_name_or_path = DATASET_MAP[args.dataset_name]
     args.task = str(cfg_get(config, "dataset_init.task", "lang2mol"))
-    args.num_workers = int(cfg_get(config, "dataset_init.num_workers", cfg_get(config, "trainer_init.num_workers", 8)))
-
-    # Method
-    args.method = str(cfg_get(config, "method_init.method", "base")).lower()
-
-    # Some models may expect these (safe assignment)
-    args.lr = float(cfg_get(config, "trainer_init.lr", 0.0))
-    args.warmup_ratio = float(cfg_get(config, "trainer_init.warmup_ratio", 0.0))
-    args.seq2seq_loss_weight = float(cfg_get(config, "method_init.seq2seq_loss_weight", 1.0))
-    args.contrastive_loss_weight = float(cfg_get(config, "method_init.contrastive_loss_weight", 0.0))
-
-    # Eval init block (optional). If missing, use sensible defaults.
-    args.split = str(cfg_get(config, "eval_init.split", "validation"))
-    args.eval_batch_size = int(cfg_get(config, "eval_init.eval_batch_size", 1))
+    args.num_workers = int(cfg_get(config, "dataset_init.num_workers", 8)/config.eval_init.num_devices)
+    args.split = str(cfg_get(config, "dataset_init.split", "validation"))
+    args.eval_batch_size = int(cfg_get(config, "dataset_init.eval_batch_size", 1))
+    
+    #  Eval init setup
+    args.eval_max_length = int(cfg_get(config, "eval_init.max_length", 512))
+    args.num_beams = int(cfg_get(config, "eval_init.num_beams", 1))
+    args.use_amp = bool(cfg_get(config, "eval_init.use_amp", False))
+    args.max_samples = int(cfg_get(config, "eval_init.max_samples", 0))
+    args.chunk_size = int(cfg_get(config, "eval_init.chunk_size", 0))
+    args.eval_precision = cfg_get(config, "eval_init.precision", "32")
     args.print_examples = int(cfg_get(config, "eval_init.print_examples", 0))
     args.offline = bool(cfg_get(config, "eval_init.offline", False))
-    args.run_text2mol_metrics = bool(cfg_get(config, "eval_init.run_text2mol_metrics", False))
     args.eval_compute_fcd = True
-
-    # Precision: can override in eval_init.precision, else fallback to trainer_init.precision
-    prec_cfg = cfg_get(config, "eval_init.precision", cfg_get(config, "trainer_init.precision", "32"))
-    args.eval_precision = parse_precision_to_autocast(prec_cfg)
-
-    # Output directory and summary file
+    args.pin_memory = bool(config.dataset_init.pin_memory)
+    args.persistent_workers = bool(config.dataset_init.persistent_workers)
+    
     args.eval_output_dir = str(cfg_get(config, "eval_init.output_dir", "results/lang2mol_eval"))
     args.summary_file = str(cfg_get(config, "eval_init.summary_file", "metrics_summary.csv"))
 
@@ -271,10 +243,11 @@ def fill_args_from_config(args: Namespace, config: Config) -> None:
     args.checkpoint_paths = normalize_checkpoint_list(cfg_get(config, "eval_init.checkpoint_paths", None))
 
 
+
 # -----------------------------
 # Metrics (computed once per checkpoint on rank 0)
 # -----------------------------
-def evaluate_from_csv(csv_path: str, run_text2mol_metrics: bool) -> Dict[str, Any]:
+def evaluate_from_csv(csv_path: str) -> Dict[str, Any]:
     gt_selfies: List[str] = []
     pred_selfies: List[str] = []
 
@@ -286,28 +259,17 @@ def evaluate_from_csv(csv_path: str, run_text2mol_metrics: bool) -> Dict[str, An
 
     results: Dict[str, Any] = {}
 
-    # Chemical metrics (your required evaluator)
-    # evaluator = Mol2Text_translation()
-    # res = evaluator(pred_selfies, gt_selfies)
-    # for k, v in res.items():
-    #     results[k] = v
-
-    # Optional extra metrics
-    if run_text2mol_metrics and Text2MolMetrics is not None:
-        try:
-            if fcd_fn is not None:
-                t2m = Text2MolMetrics(eval_text2mol=True, fcd_fn=fcd_fn)
-            else:
-                t2m = Text2MolMetrics(eval_text2mol=True, fcd_fn=None)  # type: ignore
-            res2 = t2m(predictions=pred_selfies,
-                        references=gt_selfies,
-                        selfies_gt=gt_selfies,
-                        selfies_pred=pred_selfies,)
-            print(res2)
-            for k, v in res2.items():
-                results[f"text2mol_{k}"] = v
-        except Exception as e:
-            results["text2mol_error"] = str(e)
+    try:
+        if fcd_fn is not None:
+            t2m = Text2MolMetrics(eval_text2mol=True, fcd_fn=fcd_fn)
+        res2 = t2m(predictions=pred_selfies,
+                    references=gt_selfies,
+                    selfies_gt=gt_selfies,
+                    selfies_pred=pred_selfies,)
+        for k, v in res2.items():
+            results[f"text2mol_{k}"] = v
+    except Exception as e:
+        results["text2mol_error"] = str(e)
 
     return results
 
@@ -362,8 +324,9 @@ def run_one_checkpoint(
     ckpt_name = safe_name_from_path(ckpt_path)
 
     # Output files per checkpoint
-    os.makedirs(args.eval_output_dir, exist_ok=True)
-    merged_csv = os.path.join(args.eval_output_dir, f"{ckpt_name}.pred.csv")
+    output_dir = os.path.join(args.eval_output_dir, ckpt_name)
+    os.makedirs(output_dir, exist_ok=True)
+    merged_csv = os.path.join(output_dir, f"{ckpt_name}.pred.csv")
 
     # Per rank part file
     out_part = merged_csv if not is_dist else f"{os.path.splitext(merged_csv)[0]}.rank{rank}.csv"
@@ -415,11 +378,11 @@ def run_one_checkpoint(
             part_files = [f"{os.path.splitext(merged_csv)[0]}.rank{r}.csv" for r in range(world_size)]
             merge_csv_parts(merged_csv, part_files)
 
-            metrics = evaluate_from_csv(merged_csv, run_text2mol_metrics=args.run_text2mol_metrics)
+            metrics = evaluate_from_csv(merged_csv)
             metrics_row = {"checkpoint": ckpt_path}
             metrics_row.update(metrics)
 
-            summary_csv = os.path.join(args.eval_output_dir, args.summary_file)
+            summary_csv = os.path.join(output_dir, args.summary_file)
             append_summary_row(summary_csv, metrics_row)
 
             return metrics_row
@@ -428,7 +391,7 @@ def run_one_checkpoint(
         return None
 
     # Single process
-    metrics = evaluate_from_csv(merged_csv, run_text2mol_metrics=args.run_text2mol_metrics)
+    metrics = evaluate_from_csv(merged_csv)
     metrics_row = {"checkpoint": ckpt_path}
     metrics_row.update(metrics)
     summary_csv = os.path.join(args.eval_output_dir, args.summary_file)
@@ -455,7 +418,7 @@ def main(args: Namespace, config: Config) -> None:
         os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
     # Seed (optional)
-    seed = cfg_get(config, "trainer_init.seed_everything", None)
+    seed = cfg_get(config, "eval_init.seed_everything", None)
     if seed is not None:
         torch.manual_seed(int(seed))
         if torch.cuda.is_available():
@@ -502,18 +465,11 @@ def main(args: Namespace, config: Config) -> None:
             base_dl, rank, world_size, args.num_workers
         )
 
-    # Model init once, then reload weights for each checkpoint
-    if args.method not in METHOD_MAP:
-        if "lang2mol_base" in METHOD_MAP:
-            args.method = "lang2mol_base"
-        else:
-            raise ValueError(f"Unknown method: {args.method}. Available: {', '.join(METHOD_MAP.keys())}")
 
     args.tokenizer = Namespace()
     args.tokenizer.pad_token_id = tokenizer.pad_token_id
 
-    T5ModelCls = METHOD_MAP[args.method]
-    model = T5ModelCls(args)
+    model = T5Model(args)
     model.resize_token_embeddings(len(tokenizer))
     model.to(device)
     # model.eval()
@@ -555,8 +511,8 @@ def main(args: Namespace, config: Config) -> None:
                     print(f"{k}: {v}")
                 print("\n")
 
-        # if args.cuda and is_dist:
-        #     dist.barrier()
+        if args.cuda and is_dist:
+            dist.barrier()
 
     # Cleanup
     if args.cuda:

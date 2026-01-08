@@ -29,6 +29,9 @@ pip install -r requirements.txt
 
 # install additional packages for Torch Geometric, cuda version should match with torch's cuda version
 pip install pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv -f https://data.pyg.org/whl/torch-2.1.2+cu121.html
+
+# install dependency if needed
+pip install sconf optuna fcd
 ```
 
 ### 2. Pretrained models
@@ -55,55 +58,300 @@ python preprocess_data.py --output_dir data/LPM-24-extra-extend \
                           --hf_token <your_hf_token>
 ```
 
-### 3. Training model
+## 3. Training model (configure everything via YAML)
 
-#### LPM-24 dataset:
+ChemAligner-T5 is fully **config-driven**.
+All training and evaluation behaviors are controlled through `.yaml` files, so users do **not** need to modify Python code to run experiments.
+
+You only need to prepare:
+
+* one **training config** (`*_train.yaml`)
+* one **evaluation config** (`*_eval.yaml`)
+
+Both LPM-24 and CheBI-20 use the **same config structure**, differing only in dataset names and paths.
+
+---
+
+### Config train file
+
+The training config defines **model backbone**, **training strategy**, **dataset loading**, **loss design**, and **evaluation behavior during training**.
+
+Below is a structured explanation of each section.
+
+---
+
+#### `t5`
+
+```yaml
+t5:
+  pretrained_model_name_or_path: "QizhiPei/biot5-plus-base"
+```
+
+* Specifies the **base language model**.
+* ChemAligner-T5 is built on top of **BioT5+**.
+* Any compatible T5-style checkpoint can be substituted here.
+
+---
+
+#### `trainer_init`
+
+Controls **optimization, distributed training, checkpointing, and logging**.
+
+Key fields:
+
+```yaml
+trainer_init:
+  seed_everything: 2183
+  cuda: true
+  deterministic: true
+  strategy: "ddp_find_unused_parameters_true"
+```
+
+* Ensures reproducibility.
+* Uses PyTorch Lightning with **DDP** for multi-GPU training.
+
+Checkpointing:
+
+```yaml
+  output_folder: "output/chebi20_train"
+  filename: "ckpt_{epoch}_{eval_loss}"
+  save_top_k: 3
+  monitor: "avg_metrics"
+  mode: "max"
+```
+
+* Automatically saves top-k checkpoints based on the monitored metric.
+* When `run_text2mol_metrics = true`, `avg_metrics` is recommended.
+* Otherwise, switch to `eval_loss` and `mode: min`.
+
+Training scale:
+
+```yaml
+  max_epochs: 100
+  num_devices: 4
+  grad_accum: 8
+  precision: "32"
+```
+
+* `grad_accum` enables large effective batch sizes without exceeding GPU memory.
+* Precision can be changed to `"16-mixed"` or `"bf16-mixed"` if desired.
+
+Optimizer and scheduler:
+
+```yaml
+  optimizer:
+    name: "adamw"
+    weight_decay: 1e-4
+  lr: 5e-5
+  warmup_ratio: 0.0
+```
+
+Optional hyperparameter search:
+
+```yaml
+  optuna:
+    activate: false
+```
+
+Experiment tracking:
+
+```yaml
+  wandb:
+    project: "ACL_Lang2Mol"
+    name: "chebi20_train"
+```
+
+---
+
+#### `dataset_init`
+
+Defines **which dataset to use and how it is loaded**.
+
+```yaml
+dataset_init:
+  dataset_name: "chebi-20"
+  task: "lang2mol"
+  train_batch_size: 8
+  eval_batch_size: 64
+  num_workers: 24
+```
+
+* Supported datasets:
+
+  * `lpm-24`
+  * `lpm-24-extra`
+  * `chebi-20`
+* The dataset name is internally mapped to HuggingFace datasets.
+* `num_workers` is automatically divided by the number of GPUs.
+
+---
+
+#### `method_init`
+
+Controls **training objective design**.
+
+```yaml
+method_init:
+  method: "chemaligner"
+  seq2seq_loss_weight: 1.0
+  contrastive_loss_weight: 0.3
+```
+
+* `method: base`
+  → standard BioT5+ sequence-to-sequence training
+* `method: chemaligner`
+  → joint **generation + contrastive representation alignment**
+
+Loss weights allow balancing:
+
+* token-level generation quality
+* sequence-level text–molecule alignment
+
+---
+
+#### `eval_init` (during training)
+
+Controls **on-the-fly validation**.
+
+```yaml
+eval_init:
+  max_length: 512
+  num_beams: 1
+  use_amp: true
+  run_text2mol_metrics: true
+```
+
+* Uses greedy decoding by default (`num_beams = 1`).
+* `run_text2mol_metrics` enables molecule-level metrics (FCD, similarity, etc.).
+* Validation is automatically run at the end of each epoch.
+
+Optional:
+
+```yaml
+  run_evaluate_after_trainning_done: false
+```
+
+* If enabled, all saved checkpoints will be evaluated automatically after training.
+
+---
+
+### Config validation file
+
+The evaluation config is **checkpoint-centric** and supports **single-GPU or multi-GPU evaluation**, as well as **multiple checkpoints in one run**.
+
+---
+
+#### `t5`
+
+Same as training:
+
+```yaml
+t5:
+  pretrained_model_name_or_path: "QizhiPei/biot5-plus-base"
+```
+
+---
+
+#### `dataset_init`
+
+```yaml
+dataset_init:
+  dataset_name: "chebi-20"
+  split: validation
+  eval_batch_size: 240
+```
+
+* Uses the validation split by default.
+* Batch size is **per process** (per GPU if using DDP).
+
+---
+
+#### `eval_init`
+
+Controls **generation, metrics, and output format**.
+
+```yaml
+eval_init:
+  num_devices: 1
+  cuda: true
+  max_length: 512
+  num_beams: 1
+  use_amp: true
+```
+
+Multi-checkpoint evaluation:
+
+```yaml
+  checkpoint_paths:
+    - ".../ckpt_epoch=10.ckpt"
+    - ".../ckpt_epoch=20.ckpt"
+    - ".../ckpt_epoch=30.ckpt"
+```
+
+* Each checkpoint is evaluated independently.
+* Predictions and metrics are saved per checkpoint.
+* A unified `metrics_summary.csv` is produced automatically.
+
+Output control:
+
+```yaml
+  output_dir: "results/chebi20_evaluation"
+  summary_file: "metrics_summary.csv"
+```
+
+Optional debug flags:
+
+```yaml
+  print_examples: 0
+  offline: false
+```
+
+---
+
+### Summary
+
+* **Training and evaluation are fully YAML-controlled**
+* Supports:
+
+  * single or multi-GPU
+  * multiple checkpoints per evaluation
+  * sequence-level and molecule-level metrics
+* Designed for **reproducible chemical language research**
+
+Once configs are ready, running experiments is as simple as:
+
+```bash
+python train.py --model_config src/configs/chebi20_train.yaml
+python eval_lang2mol.py --model_config src/configs/chebi20_eval.yaml
+```
+
+
+
+### LPM-24 dataset:
 
 SFT BioT5+ scripts
 
 ```zsh
-python train_lang2mol_base.py --epochs 10 --batch_size 8 \
-                --grad_accum 32 --warmup_ratio 0.00 --lr 5e-4 --num_devices 4 \
-                --dataset_name lpm-24-extra --model_config src/configs/config_lpm24_train.yaml --output_folder checkpoints/biot5p_base/SFTBioT5PlusBase --cuda
+python train.py --model_config src/configs/lpm24_train.yaml
 ```
 
-
-SFT BioT5+ with Contrastive scripts
-
+#### Evaluate on LPM-24 dataset
 ```zsh
-python train_lang2mol_contrastive.py --epochs 10 --batch_size 8 \
-                --grad_accum 32 --warmup_ratio 0.00 --lr 5e-4 --num_devices 4 \
-                --dataset_name lpm-24-extra --model_config src/configs/config_lpm24_train.yaml --output_folder checkpoints/biot5p_base/SFTBioT5plusBaseContrastive --cuda
+python eval_lang2mol.py --model_config src/configs/lpm24_eval.yaml
+
 ```
 
-
-#### CheBI-20 dataset:
+### CheBI-20 dataset:
 ```zsh
-python train.py --epochs 50 --batch_size 8 \
-                --grad_accum 32 --warmup_ratio 0.05 --lr 1e-4 --num_devices 4 \
-                --dataset_name chebi-20 --model_config src/configs/config_chebi20_train.yaml \ 
-                --cuda
-```
-
-### 4. Evaluating model
-#### Evaluate on LPM-24
-```zsh
-python eval_lang2mol.py --dataset_name lpm-24-eval \
-               --model_config src/configs/config_lpm24_lang2mol_train.yaml \
-               --output_csv results/results.csv \
-               --checkpoint_path path_to_checkpoint.ckpt \
-               --cuda
+python train.py --model_config src/configs/chebi20_train.yaml 
 ```
 
 #### Evaluate on CheBI-20
 ```zsh
-python eval.py --dataset_name chebi-20 \
-               --model_config src/configs/config_chebi20_train.yaml \
-               --checkpoint_path path/to/ckpt \
-               --cuda
+python eval_lang2mol.py --model_config src/configs/chebi20_eval.yaml
 ```
 
-#### Push to hub
+### Push to hub
 
 ```zsh
 python push_to_hub.py --model_name biot5-plus-base-sft \
